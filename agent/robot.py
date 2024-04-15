@@ -130,18 +130,47 @@ class Robot:
         if len(self.next_steps) > 0:
             return
 
-        # Call the LLM to get the next steps
-        next_steps_from_llm = self.get_moves_from_llm()
-        next_buttons_to_press = [
-            button
-            for combo in next_steps_from_llm
-            for button in META_INSTRUCTIONS_WITH_LOWER[combo][
-                self.current_direction.lower()
-            ]
-            # We add a wait time after each button press
-            + [0] * NB_FRAME_WAIT
-        ]
-        self.next_steps.extend(next_buttons_to_press)
+        # If we are in the test environment, we don't want to call the LLM
+        if os.getenv("DISABLE_LLM", "False") == "True":
+            # Choose a random int from the list of moves
+            logger.debug("DISABLE_LLM is True, returning a random move")
+            next_steps_from_llm = [random.choice(list(MOVES.values()))]
+
+        while len(self.next_steps) == 0:
+            llm_stream = self.call_llm()
+
+            llm_response = ""
+
+            for r in llm_stream:
+                llm_response += r.delta
+
+                try:
+                    # Call the LLM to get the next steps
+                    next_steps_from_llm = self.get_moves_from_llm(llm_response)
+
+                    if len(next_steps_from_llm) == 0:
+                        continue
+
+                    # here was can reset the response because we already got the move
+                    llm_response = ""
+
+                    next_buttons_to_press = [
+                        button
+                        for combo in next_steps_from_llm
+                        for button in META_INSTRUCTIONS_WITH_LOWER[combo][
+                            self.current_direction.lower()
+                        ]
+                        # We add a wait time after each button press
+                        + [0] * NB_FRAME_WAIT
+                    ]
+                    self.next_steps.extend(next_buttons_to_press)
+
+                    # lets set a max number of moves before we stop
+                    max_moves = 8
+                    if len(self.next_steps) > max_moves:
+                        return None
+                except Exception as e:
+                    continue
 
     def observe(self, observation: dict, actions: dict, reward: float):
         """
@@ -274,60 +303,41 @@ To increase your score, move toward the opponent and attack the opponent. To pre
 
     def get_moves_from_llm(
         self,
+        llm_response: str = None,
     ) -> List[str]:
         """
         Get a list of moves from the language model.
         """
 
+        print(f"llm_response: {llm_response}")
+
         # Filter the moves that are not in the list of moves
         invalid_moves = []
         valid_moves = []
 
-        # If we are in the test environment, we don't want to call the LLM
-        if os.getenv("DISABLE_LLM", "False") == "True":
-            # Choose a random int from the list of moves
-            logger.debug("DISABLE_LLM is True, returning a random move")
-            return [random.choice(list(MOVES.values()))]
+        # The response is a bullet point list of moves. Use regex
+        matches = re.findall(r"- ([\w ]+)", llm_response)
+        moves = ["".join(match) for match in matches]
+        invalid_moves = []
+        valid_moves = []
+        for move in moves:
+            cleaned_move_name = move.strip().lower()
+            if cleaned_move_name in META_INSTRUCTIONS_WITH_LOWER.keys():
+                if self.player_nb == 1:
+                    print(f"[red] Player {self.player_nb} move: {cleaned_move_name}")
+                elif self.player_nb == 2:
+                    print(f"[green] Player {self.player_nb} move: {cleaned_move_name}")
+                valid_moves.append(cleaned_move_name)
+            else:
+                logger.debug(f"Invalid completion: {move}")
+                logger.debug(f"Cleaned move name: {cleaned_move_name}")
+                invalid_moves.append(move)
 
-        while len(valid_moves) == 0:
-            llm_stream = self.call_llm()
+        if len(invalid_moves) > 1:
+            logger.warning(f"Many invalid moves: {invalid_moves}")
 
-            # adding support for streaming the response
-            # this should make the players faster!
-
-            llm_response = ""
-
-            for r in llm_stream:
-                print(r.delta, end="")
-                llm_response += r.delta
-
-                # The response is a bullet point list of moves. Use regex
-                matches = re.findall(r"- ([\w ]+)", llm_response)
-                moves = ["".join(match) for match in matches]
-                invalid_moves = []
-                valid_moves = []
-                for move in moves:
-                    cleaned_move_name = move.strip().lower()
-                    if cleaned_move_name in META_INSTRUCTIONS_WITH_LOWER.keys():
-                        if self.player_nb == 1:
-                            print(
-                                f"[red] Player {self.player_nb} move: {cleaned_move_name}"
-                            )
-                        elif self.player_nb == 2:
-                            print(
-                                f"[green] Player {self.player_nb} move: {cleaned_move_name}"
-                            )
-                        valid_moves.append(cleaned_move_name)
-                    else:
-                        logger.debug(f"Invalid completion: {move}")
-                        logger.debug(f"Cleaned move name: {cleaned_move_name}")
-                        invalid_moves.append(move)
-
-                if len(invalid_moves) > 1:
-                    logger.warning(f"Many invalid moves: {invalid_moves}")
-
-            logger.debug(f"Next moves: {valid_moves}")
-            return valid_moves
+        logger.debug(f"Next moves: {valid_moves}")
+        return valid_moves
 
     def call_llm(
         self,
